@@ -1,4 +1,4 @@
-## Interface: 110000
+## Interface: 50503,110207,120000
 ## Title: Repair Reminder
 ## Notes: Reminds you to repair when visiting a vendor.
 ## Author: Fisks
@@ -6,3 +6,4 @@
 ## SavedVariables: RepairReminderDB
 
 RepairReminder.lua
+
