@@ -7,9 +7,11 @@
 --   /rrdur <percent>  -> set durability threshold (warn only if AVERAGE durability is below X%)
 -- Button:
 --   Bottom-right "Repair All" button (shows only at repair-capable merchants)
---   Tooltip includes cost (with coin icon) + durability indicator (red/yellow/green)
+--   Tooltip includes cost (with SAFE coin icon) + durability indicator (red/yellow/green)
 --   Click: repair with personal funds
 --   Alt-Click: attempt guild repairs (if allowed)
+--
+-- NOTE: This version avoids MoneyFrame textures/helpers to prevent "secret value" errors.
 
 RepairReminderDB = RepairReminderDB or {}
 
@@ -64,11 +66,29 @@ local function GetThreshold()
   return RepairReminderDB.durabilityThresholdPercent or DEFAULT_DURABILITY_THRESHOLD_PERCENT
 end
 
+-- Safe money formatting (no MoneyFrame / GetCoinTextureString usage)
+local function MoneyString(copper)
+  copper = tonumber(copper) or 0
+  if copper < 0 then copper = 0 end
+
+  local gold = math.floor(copper / 10000)
+  local silver = math.floor((copper % 10000) / 100)
+  local cop = copper % 100
+
+  if gold > 0 then
+    return string.format("%dg %ds %dc", gold, silver, cop)
+  elseif silver > 0 then
+    return string.format("%ds %dc", silver, cop)
+  else
+    return string.format("%dc", cop)
+  end
+end
+
 ------------------------------------------------------------
 -- Durability
 ------------------------------------------------------------
 -- Returns:
---   avgPct (number)  average durability % across equipped items with durability
+--   avgPct (number)    average durability % across equipped items with durability
 --   lowestPct (number) lowest durability % across equipped items with durability
 --   nil, nil if no durability-bearing items are found
 local function GetEquippedDurabilityStats()
@@ -112,10 +132,6 @@ local function GetRepairCost()
   return 0, false
 end
 
-local function MoneyString(copper)
-  return GetCoinTextureString and GetCoinTextureString(copper) or (tostring(copper) .. "c")
-end
-
 ------------------------------------------------------------
 -- UI: Bottom-right Repair button (styled: icon + tooltip)
 ------------------------------------------------------------
@@ -135,7 +151,7 @@ local function CreateRepairButton()
   repairButton:ClearAllPoints()
   repairButton:SetPoint("BOTTOMRIGHT", MerchantFrame, "BOTTOMRIGHT", -28, 28)
 
-  -- Left icon (repair icon)
+  -- Left icon (repair icon - safe)
   local icon = repairButton:CreateTexture(nil, "ARTWORK")
   icon:SetSize(16, 16)
   icon:SetPoint("LEFT", repairButton, "LEFT", 8, 0)
@@ -149,7 +165,8 @@ local function CreateRepairButton()
     fontString:SetPoint("CENTER", repairButton, "CENTER", 8, 0)
   end
 
-  local coinIcon = "|TInterface\\MoneyFrame\\UI-GoldIcon:14:14:0:0|t"
+  -- SAFE coin icon (avoid MoneyFrame textures)
+  local coinIcon = "|TInterface\\Icons\\INV_Misc_Coin_01:14:14:0:0|t"
 
   local function GetDurabilityIndicator(avg, threshold)
     if not avg then
@@ -182,14 +199,14 @@ local function CreateRepairButton()
       GameTooltip:AddLine("Merchant cannot repair.", 1, 0.2, 0.2)
     end
 
-    -- Cost line (coin icon when cost exists)
+    -- Cost line (with safe coin icon when cost exists)
     if canRepair and canRepairCost and cost and cost > 0 then
       GameTooltip:AddDoubleLine(coinIcon .. " Cost", MoneyString(cost), 1, 1, 1, 1, 1, 1)
     else
       GameTooltip:AddDoubleLine("Cost", "—", 1, 1, 1, 0.8, 0.8, 0.8)
     end
 
-    -- Durability indicator (based on AVERAGE)
+    -- Durability indicator (based on average)
     local durText, r, g, b = GetDurabilityIndicator(avg, threshold)
     GameTooltip:AddLine(" ", 1, 1, 1)
     GameTooltip:AddLine(durText, r, g, b)
@@ -380,4 +397,3 @@ frame:SetScript("OnEvent", function(_, event)
     repairButton:Hide()
   end
 end)
-
