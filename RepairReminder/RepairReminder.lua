@@ -1,251 +1,383 @@
-local addonName = ...
-local f = CreateFrame("Frame")
+-- RepairReminder.lua
+-- Reminds you to repair when visiting a vendor.
+-- Features:
+--   /rr <minutes>     -> set reminder interval
+--   /rr on|off        -> enable/disable reminders + button
+--   /rr reset         -> reset to defaults
+--   /rrdur <percent>  -> set durability threshold (warn only if AVERAGE durability is below X%)
+-- Button:
+--   Bottom-right "Repair All" button (shows only at repair-capable merchants)
+--   Tooltip includes cost (with coin icon) + durability indicator (red/yellow/green)
+--   Click: repair with personal funds
+--   Alt-Click: attempt guild repairs (if allowed)
 
-local DEFAULTS = {
-  enabled = true,
-  threshold = 50,       -- remind when overall durability is at or below this %
-  resetAt = 95,         -- reset reminder when overall durability is at or above this %
-  quietReset = true,    -- don't print a "reset" message
-  showWorstItem = true, -- include lowest item durability in reminder
-  renudgeMinutes = 0,   -- 0 = off; otherwise re-remind after this many minutes (on vendor open)
-}
+RepairReminderDB = RepairReminderDB or {}
 
--- Session state (resets on relog / /reload)
-local remindedThisSession = false
-local lastReminderAt = 0 -- seconds since login (GetTime())
+-- Defaults
+local DEFAULT_INTERVAL_MINUTES = 90
+local DEFAULT_DURABILITY_THRESHOLD_PERCENT = 50
+local DEFAULT_ENABLED = true
 
-local SLOT_NAMES = {
-  [1] = "Head",
-  [2] = "Neck",
-  [3] = "Shoulder",
-  [4] = "Shirt",
-  [5] = "Chest",
-  [6] = "Waist",
-  [7] = "Legs",
-  [8] = "Feet",
-  [9] = "Wrist",
-  [10] = "Hands",
-  [11] = "Finger 1",
-  [12] = "Finger 2",
-  [13] = "Trinket 1",
-  [14] = "Trinket 2",
-  [15] = "Back",
-  [16] = "Main Hand",
-  [17] = "Off Hand",
-  [18] = "Ranged",
-}
+-- Runtime
+local lastReminderAt = 0
+local repairButton
+
+DEFAULT_CHAT_FRAME:AddMessage("|cff00ff00RepairReminder loaded.|r")
+
+------------------------------------------------------------
+-- Helpers
+------------------------------------------------------------
+local function Trim(s)
+  return (s or ""):match("^%s*(.-)%s*$")
+end
 
 local function Print(msg)
-  print("|cff00ff00[RepairReminder]|r " .. msg)
+  DEFAULT_CHAT_FRAME:AddMessage(msg)
 end
 
-local function GetDurabilityStats()
-  local totalCur, totalMax = 0, 0
-  local worstPct, worstSlot = 101, nil
+local function ApplyDefaults()
+  if RepairReminderDB.enabled == nil then
+    RepairReminderDB.enabled = DEFAULT_ENABLED
+  end
+  if RepairReminderDB.intervalMinutes == nil then
+    RepairReminderDB.intervalMinutes = DEFAULT_INTERVAL_MINUTES
+  end
+  if RepairReminderDB.durabilityThresholdPercent == nil then
+    RepairReminderDB.durabilityThresholdPercent = DEFAULT_DURABILITY_THRESHOLD_PERCENT
+  end
+end
 
-  for slot = 1, 18 do
-    local cur, max = GetInventoryItemDurability(slot)
+local function ResetDefaults()
+  RepairReminderDB = {
+    enabled = DEFAULT_ENABLED,
+    intervalMinutes = DEFAULT_INTERVAL_MINUTES,
+    durabilityThresholdPercent = DEFAULT_DURABILITY_THRESHOLD_PERCENT,
+  }
+  lastReminderAt = 0
+end
+
+local function GetIntervalSeconds()
+  return (RepairReminderDB.intervalMinutes or DEFAULT_INTERVAL_MINUTES) * 60
+end
+
+local function GetThreshold()
+  return RepairReminderDB.durabilityThresholdPercent or DEFAULT_DURABILITY_THRESHOLD_PERCENT
+end
+
+------------------------------------------------------------
+-- Durability
+------------------------------------------------------------
+-- Returns:
+--   avgPct (number)  average durability % across equipped items with durability
+--   lowestPct (number) lowest durability % across equipped items with durability
+--   nil, nil if no durability-bearing items are found
+local function GetEquippedDurabilityStats()
+  local slots = { 1, 3, 5, 6, 7, 8, 9, 10, 15, 16, 17 }
+
+  local sumPct = 0
+  local count = 0
+  local lowest = nil
+
+  for _, slotId in ipairs(slots) do
+    local cur, max = GetInventoryItemDurability(slotId)
     if cur and max and max > 0 then
-      totalCur = totalCur + cur
-      totalMax = totalMax + max
-
       local pct = (cur / max) * 100
-      if pct < worstPct then
-        worstPct = pct
-        worstSlot = slot
+      sumPct = sumPct + pct
+      count = count + 1
+      if (not lowest) or pct < lowest then
+        lowest = pct
       end
     end
   end
 
-  local overall = (totalMax > 0) and ((totalCur / totalMax) * 100) or 100
-  if worstSlot == nil then
-    worstPct = nil
+  if count == 0 then
+    return nil, nil
   end
 
-  return overall, worstSlot, worstPct
+  return (sumPct / count), lowest
 end
 
-local function FormatMoney(copper)
-  if not copper or copper <= 0 then return "0g" end
-  local gold = math.floor(copper / 10000)
-  local silver = math.floor((copper % 10000) / 100)
-  local c = copper % 100
+------------------------------------------------------------
+-- Merchant helpers
+------------------------------------------------------------
+local function CanRepairHere()
+  return type(CanMerchantRepair) == "function" and CanMerchantRepair()
+end
 
-  if gold > 0 then
-    return string.format("%dg %ds %dc", gold, silver, c)
-  elseif silver > 0 then
-    return string.format("%ds %dc", silver, c)
-  else
-    return string.format("%dc", c)
+local function GetRepairCost()
+  if type(GetRepairAllCost) == "function" then
+    local cost, canRepair = GetRepairAllCost()
+    return cost or 0, canRepair
   end
+  return 0, false
 end
 
-local function ShouldRenudge()
-  local mins = tonumber(RepairReminderDB.renudgeMinutes) or 0
-  if mins <= 0 then return false end
-  if lastReminderAt <= 0 then return true end
-  return (GetTime() - lastReminderAt) >= (mins * 60)
+local function MoneyString(copper)
+  return GetCoinTextureString and GetCoinTextureString(copper) or (tostring(copper) .. "c")
 end
 
-local function MaybeRemindOnMerchant()
-  if not RepairReminderDB.enabled then return end
+------------------------------------------------------------
+-- UI: Bottom-right Repair button (styled: icon + tooltip)
+------------------------------------------------------------
+local function CreateRepairButton()
+  if repairButton or not MerchantFrame then return end
 
-  -- UX guardrail: no reminder while in combat
-  if UnitAffectingCombat("player") then return end
+  repairButton = CreateFrame(
+    "Button",
+    "RepairReminderRepairButton",
+    MerchantFrame,
+    "UIPanelButtonTemplate"
+  )
 
-  if not CanMerchantRepair() then return end
+  repairButton:SetSize(170, 24)
 
-  local cost, canRepairNow = GetRepairAllCost()
-  if not cost or cost <= 0 then return end -- nothing to repair
+  -- Bottom-right anchor (stable)
+  repairButton:ClearAllPoints()
+  repairButton:SetPoint("BOTTOMRIGHT", MerchantFrame, "BOTTOMRIGHT", -28, 28)
 
-  local overall, worstSlot, worstPct = GetDurabilityStats()
+  -- Left icon (repair icon)
+  local icon = repairButton:CreateTexture(nil, "ARTWORK")
+  icon:SetSize(16, 16)
+  icon:SetPoint("LEFT", repairButton, "LEFT", 8, 0)
+  icon:SetTexture("Interface\\MerchantFrame\\UI-Merchant-Repair")
+  repairButton.icon = icon
 
-  -- Remind at or below threshold
-  if overall > RepairReminderDB.threshold then return end
-
-  -- One reminder per session, unless renudge is enabled and time has passed
-  if remindedThisSession and not ShouldRenudge() then return end
-
-  local costText = FormatMoney(cost)
-
-  local detail = ""
-  if RepairReminderDB.showWorstItem and worstSlot and worstPct then
-    local slotName = SLOT_NAMES[worstSlot] or ("Slot " .. tostring(worstSlot))
-    detail = string.format(" | Worst: %s %.0f%%", slotName, worstPct)
-  end
-
-  if canRepairNow then
-    Print(string.format(
-      "Durability: %.0f%% (at or below %d%%). Repair cost: %s%s",
-      overall, RepairReminderDB.threshold, costText, detail
-    ))
-  else
-    Print(string.format(
-      "Durability: %.0f%% (at or below %d%%). Repair cost: %s (not enough gold)%s",
-      overall, RepairReminderDB.threshold, costText, detail
-    ))
+  -- Re-center text with room for icon
+  local fontString = repairButton:GetFontString()
+  if fontString then
+    fontString:ClearAllPoints()
+    fontString:SetPoint("CENTER", repairButton, "CENTER", 8, 0)
   end
 
-  remindedThisSession = true
-  lastReminderAt = GetTime()
-end
+  local coinIcon = "|TInterface\\MoneyFrame\\UI-GoldIcon:14:14:0:0|t"
 
-local function CheckForRepairReset()
-  if not remindedThisSession then return end
+  local function GetDurabilityIndicator(avg, threshold)
+    if not avg then
+      return "Average durability: Unknown", 0.8, 0.8, 0.8
+    end
 
-  local overall = select(1, GetDurabilityStats())
-  if overall >= RepairReminderDB.resetAt then
-    remindedThisSession = false
-    lastReminderAt = 0
-    if not RepairReminderDB.quietReset then
-      Print(string.format("Repaired (≥%d%%). Reminder reset.", RepairReminderDB.resetAt))
+    if avg < threshold then
+      return string.format("Average durability: %.0f%% (Below %d%%)", avg, threshold), 1.0, 0.2, 0.2
+    elseif avg < (threshold + 10) then
+      return string.format("Average durability: %.0f%% (Near %d%%)", avg, threshold), 1.0, 0.82, 0.2
+    else
+      return string.format("Average durability: %.0f%% (OK)", avg), 0.2, 1.0, 0.2
     end
   end
+
+  -- Tooltip
+  repairButton:SetScript("OnEnter", function(self)
+    GameTooltip:SetOwner(self, "ANCHOR_TOPLEFT")
+
+    local canRepair = CanRepairHere()
+    local cost, canRepairCost = GetRepairCost()
+    local avg, lowest = GetEquippedDurabilityStats()
+    local threshold = GetThreshold()
+
+    GameTooltip:AddLine("Repair All Now", 1, 1, 1)
+
+    if canRepair then
+      GameTooltip:AddLine("Merchant can repair.", 0.2, 1, 0.2)
+    else
+      GameTooltip:AddLine("Merchant cannot repair.", 1, 0.2, 0.2)
+    end
+
+    -- Cost line (coin icon when cost exists)
+    if canRepair and canRepairCost and cost and cost > 0 then
+      GameTooltip:AddDoubleLine(coinIcon .. " Cost", MoneyString(cost), 1, 1, 1, 1, 1, 1)
+    else
+      GameTooltip:AddDoubleLine("Cost", "—", 1, 1, 1, 0.8, 0.8, 0.8)
+    end
+
+    -- Durability indicator (based on AVERAGE)
+    local durText, r, g, b = GetDurabilityIndicator(avg, threshold)
+    GameTooltip:AddLine(" ", 1, 1, 1)
+    GameTooltip:AddLine(durText, r, g, b)
+
+    -- Detail lines (use "lowest" wording)
+    if avg then
+      GameTooltip:AddDoubleLine("Average durability", string.format("%.0f%%", avg), 1, 1, 1, 1, 1, 1)
+    end
+    if lowest then
+      GameTooltip:AddDoubleLine("Lowest durability", string.format("%.0f%%", lowest), 1, 1, 1, 1, 1, 1)
+    end
+    GameTooltip:AddDoubleLine("Reminder threshold", string.format("%d%%", threshold), 1, 1, 1, 1, 1, 1)
+
+    GameTooltip:AddLine(" ", 1, 1, 1)
+    GameTooltip:AddLine("Click: Repair all items", 0.8, 0.8, 0.8)
+    GameTooltip:AddLine("Alt-Click: Try guild repairs (if enabled)", 0.8, 0.8, 0.8)
+    GameTooltip:Show()
+  end)
+
+  repairButton:SetScript("OnLeave", function()
+    GameTooltip:Hide()
+  end)
+
+  -- Click behavior (Alt-click attempts guild repair)
+  repairButton:SetScript("OnClick", function()
+    if not CanRepairHere() then return end
+
+    local cost, canRepair = GetRepairCost()
+    if not canRepair or not cost or cost <= 0 then
+      Print("|cffffff00RepairReminder: Nothing to repair.|r")
+      return
+    end
+
+    local useGuild = IsAltKeyDown() and CanGuildBankRepair and CanGuildBankRepair()
+    RepairAllItems(useGuild and true or false)
+
+    if useGuild then
+      Print(("|cff00ff00RepairReminder: Repaired all items using guild funds (%s).|r"):format(MoneyString(cost)))
+    else
+      Print(("|cff00ff00RepairReminder: Repaired all items for %s.|r"):format(MoneyString(cost)))
+    end
+  end)
+
+  repairButton:Hide()
 end
 
-local function HandleSlash(msg)
-  msg = (msg or ""):lower():gsub("^%s+", ""):gsub("%s+$", "")
+local function UpdateRepairButton()
+  CreateRepairButton()
+  if not repairButton then return end
 
-  if msg == "" or msg == "status" then
-    local overall, worstSlot, worstPct = GetDurabilityStats()
-    local worst = (worstSlot and worstPct)
-      and string.format("%s %.0f%%", SLOT_NAMES[worstSlot] or ("Slot " .. worstSlot), worstPct)
-      or "n/a"
+  if CanRepairHere() then
+    local cost, canRepair = GetRepairCost()
 
-    Print(string.format(
-      "Enabled: %s | Threshold: %d%% | ResetAt: %d%% | QuietReset: %s | WorstItem: %s | Renudge: %s | Current: %.0f%% | Worst: %s",
-      tostring(RepairReminderDB.enabled),
-      RepairReminderDB.threshold,
-      RepairReminderDB.resetAt,
-      tostring(RepairReminderDB.quietReset),
-      tostring(RepairReminderDB.showWorstItem),
-      (RepairReminderDB.renudgeMinutes > 0) and (RepairReminderDB.renudgeMinutes .. "m") or "off",
-      overall,
-      worst
-    ))
-    Print("Commands: /rr on|off | /rr <number> | /rr reset | /rr quiet on|off | /rr worst on|off | /rr renudge <mins>")
+    if canRepair and cost and cost > 0 then
+      repairButton:SetText(("Repair All (%s)"):format(MoneyString(cost)))
+      repairButton.icon:SetVertexColor(1, 1, 1)
+      repairButton:Enable()
+    else
+      repairButton:SetText("Repair All")
+      repairButton.icon:SetVertexColor(0.6, 0.6, 0.6)
+      repairButton:Disable()
+    end
+
+    repairButton:Show()
+  else
+    repairButton:Hide()
+  end
+end
+
+------------------------------------------------------------
+-- Slash commands
+------------------------------------------------------------
+SLASH_REPAIRREMINDER1 = "/rr"
+SLASH_REPAIRREMINDER2 = "/repairreminder"
+
+SlashCmdList["REPAIRREMINDER"] = function(msg)
+  msg = Trim(msg)
+  ApplyDefaults()
+
+  local lower = msg:lower()
+
+  if lower == "" then
+    Print(("|cff00ff00RepairReminder|r: %s | interval %d min | threshold %d%%")
+      :format(
+        RepairReminderDB.enabled and "ON" or "OFF",
+        RepairReminderDB.intervalMinutes,
+        GetThreshold()
+      ))
+    Print("Commands: /rr <minutes> | on | off | reset | /rrdur <percent>")
     return
   end
 
-  if msg == "on" then
+  if lower == "on" then
     RepairReminderDB.enabled = true
-    Print("Enabled.")
+    Print("|cff00ff00RepairReminder enabled.|r")
     return
-  elseif msg == "off" then
+  end
+
+  if lower == "off" then
     RepairReminderDB.enabled = false
-    Print("Disabled.")
-    return
-  elseif msg == "reset" then
-    remindedThisSession = false
-    lastReminderAt = 0
-    Print("Session reminder reset (manual).")
+    Print("|cffff0000RepairReminder disabled.|r")
     return
   end
 
-  local a, b = msg:match("^(%S+)%s+(%S+)$")
-  if a == "quiet" then
-    RepairReminderDB.quietReset = (b == "on")
-    Print("quietReset set to " .. tostring(RepairReminderDB.quietReset) .. ".")
-    return
-  elseif a == "worst" then
-    RepairReminderDB.showWorstItem = (b == "on")
-    Print("showWorstItem set to " .. tostring(RepairReminderDB.showWorstItem) .. ".")
-    return
-  elseif a == "renudge" then
-    local n = tonumber(b) or 0
-    n = math.max(0, math.floor(n))
-    RepairReminderDB.renudgeMinutes = n
-    Print("renudgeMinutes set to " .. ((n > 0) and (n .. " minutes") or "off") .. ".")
+  if lower == "reset" then
+    ResetDefaults()
+    Print(("|cff00ff00RepairReminder reset to defaults.|r Interval %d min, threshold %d%%, enabled %s.")
+      :format(RepairReminderDB.intervalMinutes, RepairReminderDB.durabilityThresholdPercent, tostring(RepairReminderDB.enabled)))
     return
   end
 
-  local n = tonumber(msg:gsub("%%", ""))
-  if n then
-    n = math.max(1, math.min(100, math.floor(n)))
-    RepairReminderDB.threshold = n
-    Print("Threshold set to " .. n .. "%.")
+  local minutes = tonumber(msg, 10)
+  if not minutes or minutes < 1 then
+    Print("|cffffff00Usage: /rr <minutes> (example: /rr 90) | on | off | reset|r")
     return
   end
 
-  Print("Unknown command. Try /rr status")
+  RepairReminderDB.intervalMinutes = minutes
+  Print(("|cff00ff00RepairReminder interval set to %d minutes.|r"):format(minutes))
 end
 
-f:RegisterEvent("ADDON_LOADED")
-f:RegisterEvent("PLAYER_LOGIN")
-f:RegisterEvent("MERCHANT_SHOW")
-f:RegisterEvent("UPDATE_INVENTORY_DURABILITY")
+SLASH_REPAIRREMINDERDUR1 = "/rrdur"
+SLASH_REPAIRREMINDERDUR2 = "/repairreminderdur"
 
-f:SetScript("OnEvent", function(self, event, ...)
-  if event == "ADDON_LOADED" then
-    local name = ...
-    if name ~= addonName then return end
+SlashCmdList["REPAIRREMINDERDUR"] = function(msg)
+  msg = Trim(msg)
+  ApplyDefaults()
 
-    RepairReminderDB = RepairReminderDB or {}
-    for k, v in pairs(DEFAULTS) do
-      if RepairReminderDB[k] == nil then
-        RepairReminderDB[k] = v
-      end
-    end
-
-    SLASH_REPAIRREMINDER1 = "/rr"
-    SlashCmdList["REPAIRREMINDER"] = HandleSlash
+  if msg == "" then
+    Print(("RepairReminder: durability threshold is %d%% (warn only if AVERAGE durability is below this).")
+      :format(GetThreshold()))
+    Print("Usage: /rrdur <percent>   Example: /rrdur 40")
     return
   end
 
+  local pct = tonumber(msg, 10)
+  if not pct or pct < 1 or pct > 100 then
+    Print("|cffffff00Usage: /rrdur <1-100> (example: /rrdur 40)|r")
+    return
+  end
+
+  RepairReminderDB.durabilityThresholdPercent = pct
+  Print(("|cff00ff00RepairReminder durability threshold set to %d%%.|r"):format(pct))
+end
+
+------------------------------------------------------------
+-- Events
+------------------------------------------------------------
+local frame = CreateFrame("Frame")
+frame:RegisterEvent("PLAYER_LOGIN")
+frame:RegisterEvent("MERCHANT_SHOW")
+frame:RegisterEvent("MERCHANT_CLOSED")
+
+frame:SetScript("OnEvent", function(_, event)
   if event == "PLAYER_LOGIN" then
-    remindedThisSession = false
-    lastReminderAt = 0
-    Print("Loaded. Type /rr status for options.")
+    ApplyDefaults()
+    CreateRepairButton()
     return
   end
 
   if event == "MERCHANT_SHOW" then
-    MaybeRemindOnMerchant()
+    UpdateRepairButton()
+
+    if not RepairReminderDB.enabled then return end
+    if not CanRepairHere() then return end
+
+    -- Rate-limit reminders
+    local now = time()
+    if now - lastReminderAt < GetIntervalSeconds() then return end
+
+    -- Reminder trigger based on AVERAGE durability
+    local avg = select(1, GetEquippedDurabilityStats())
+    local threshold = GetThreshold()
+
+    -- If we can't detect durability, remind anyway (rare)
+    if (not avg) or (avg < threshold) then
+      if avg then
+        Print(("|cffff0000RepairReminder: Repair suggested! Average durability %.0f%% (threshold %d%%).|r"):format(avg, threshold))
+      else
+        Print("|cffff0000RepairReminder: Repair suggested! (Durability unknown)|r")
+      end
+      lastReminderAt = now
+    end
     return
   end
 
-  if event == "UPDATE_INVENTORY_DURABILITY" then
-    CheckForRepairReset()
-    return
+  if event == "MERCHANT_CLOSED" and repairButton then
+    repairButton:Hide()
   end
 end)
+
