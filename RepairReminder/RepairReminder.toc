@@ -1,9 +1,11 @@
-## Interface: 50503,110207,120000
-## Title: Repair Reminder
-## Notes: Reminds you to repair when visiting a vendor.
+## Interface: 120100
+## Title: RepairReminder
+## Notes: Reminds you to repair gear based on average durability and provides a quick repair button.
 ## Author: Fisks
-## Version: 0.3.0
+## Version: 1.1.0
 ## SavedVariables: RepairReminderDB
 
-RepairReminder.lua
+## X-Curse-Project-ID: 0
+## X-Wago-ID: 0
 
+RepairReminder.lua
